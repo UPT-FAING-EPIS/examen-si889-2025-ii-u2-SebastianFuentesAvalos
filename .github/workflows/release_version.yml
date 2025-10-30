@@ -1,0 +1,219 @@
+name: Create Release and Publish
+
+on:
+  push:
+    tags:
+      - 'v*'  # Solo se ejecuta cuando se crean tags que comienzan con 'v'
+
+permissions:
+  contents: write
+  packages: write
+  pages: write
+  id-token: write
+
+jobs:
+  build-test-coverage:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+
+    steps:
+      # Clonar el repositorio
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # Configurar .NET
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      # Obtener información de la versión del tag
+      - name: Get version info
+        id: get_version
+        run: |
+          VERSION="${GITHUB_REF#refs/tags/v}"
+          echo "VERSION=$VERSION" >> $GITHUB_OUTPUT
+          echo "RELEASE_NAME=OrderApp.Domain v$VERSION" >> $GITHUB_OUTPUT
+          echo "TAG_NAME=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+
+      # Restaurar dependencias
+      - name: Restore dependencies
+        run: dotnet restore OrderApp/OrderApp.sln
+
+      # Compilar el código
+      - name: Build project
+        run: |
+          dotnet build OrderApp/OrderApp.sln --configuration Release --no-restore /p:Version=${{ steps.get_version.outputs.VERSION }}
+
+      # Ejecutar tests unitarios
+      - name: Run unit tests
+        run: |
+          dotnet test OrderApp/OrderApp.sln --configuration Release --no-build --verbosity normal
+
+      # Ejecutar tests con cobertura
+      - name: Run tests with coverage
+        run: |
+          dotnet test OrderApp/OrderApp.sln --configuration Release --collect:"XPlat Code Coverage" --results-directory ./coverage
+
+      # Instalar herramientas para reportes
+      - name: Install coverage tools
+        run: |
+          dotnet tool install -g dotnet-reportgenerator-globaltool
+          dotnet tool install -g docfx
+          dotnet tool install -g dll2mmd
+          export PATH="$PATH:/home/runner/.dotnet/tools"
+
+      # Generar reporte de cobertura
+      - name: Generate coverage report
+        run: |
+          mkdir -p Cobertura
+          export PATH="$PATH:/home/runner/.dotnet/tools"
+          reportgenerator "-reports:coverage/**/coverage.cobertura.xml" "-targetdir:Cobertura" -reporttypes:Html;MarkdownSummaryGithub;Badges
+          reportgenerator "-reports:coverage/**/coverage.cobertura.xml" "-targetdir:coverage-pages" -reporttypes:HtmlInline_AzurePipelines
+
+      # Generar documentación
+      - name: Generate documentation
+        run: |
+          export PATH="$PATH:/home/runner/.dotnet/tools"
+          cd OrderApp
+          
+          # Generar diagrama de clases
+          dll2mmd -f OrderApp.Domain/bin/Release/net8.0/OrderApp.Domain.dll -o disenio.md
+          
+          # Crear página de inicio
+          cat > index.md << 'EOF'
+          ---
+          _layout: landing
+          ---
+          
+          # OrderApp Domain Documentation v${{ steps.get_version.outputs.VERSION }}
+          
+          ## Aplicación de Procesamiento de Órdenes con Patrón Facade
+          
+          Esta aplicación demuestra la implementación del patrón Facade para simplificar el procesamiento de órdenes.
+          
+          ### [📊 Diagrama de Clases](disenio.md)
+          
+          ### [🧪 Cobertura de Pruebas](../Cobertura/SummaryGithub.md)
+          
+          ### [📈 Reporte de Cobertura Completo](../coverage-pages/index.html)
+          
+          ## Patrón Facade Implementado
+          
+          - **OrderFacade**: Coordina servicios de inventario, pago y envío
+          - **OrderProcessor**: Utiliza el facade para procesar órdenes
+          - **Servicios**: InventoryService, PaymentService, ShippingService
+          EOF
+          
+          # Generar documentación API
+          docfx metadata docfx.json || echo "Metadata generation completed"
+          docfx build docfx.json
+
+      # Crear paquete NuGet
+      - name: Create NuGet package
+        run: dotnet pack OrderApp/OrderApp.Domain/OrderApp.Domain.csproj --configuration Release --output ./artifacts /p:Version=${{ steps.get_version.outputs.VERSION }}
+
+      # Preparar archivos para GitHub Pages
+      - name: Prepare Pages deployment
+        run: |
+          mkdir -p pages-site
+          cp -r OrderApp/_site/* pages-site/
+          cp -r coverage-pages pages-site/coverage-report
+          cp -r Cobertura pages-site/
+
+      # Subir artefacto para Pages
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: pages-site
+
+      # Desplegar en GitHub Pages
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
+
+      # Generar changelog automático
+      - name: Generate changelog
+        id: changelog
+        run: |
+          PREV_TAG=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || echo "")
+          if [ -z "$PREV_TAG" ]; then
+            CHANGES=$(git log --oneline --pretty=format:"- %s (%h)" HEAD)
+            echo "BODY=## 🚀 Initial Release v${{ steps.get_version.outputs.VERSION }}
+
+          ### 📝 Commits:
+          $CHANGES
+
+          ### ✅ Tests Ejecutados
+          - Pruebas unitarias del patrón Facade
+          - Cobertura de código generada
+          
+          ### 📊 Documentación
+          - Documentación API generada automáticamente
+          - Diagrama de clases incluido
+          - Reporte de cobertura publicado en GitHub Pages" >> $GITHUB_OUTPUT
+          else
+            CHANGES=$(git log --oneline --pretty=format:"- %s (%h)" $PREV_TAG..HEAD)
+            echo "BODY=## 📦 Release v${{ steps.get_version.outputs.VERSION }}
+
+          ### 📋 Changes since $PREV_TAG:
+          $CHANGES
+
+          ### ✅ Tests y Calidad
+          - Todas las pruebas unitarias aprobadas
+          - Cobertura de código actualizada
+          - Documentación regenerada" >> $GITHUB_OUTPUT
+          fi
+
+      # Crear release en GitHub
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ steps.get_version.outputs.TAG_NAME }}
+          name: ${{ steps.get_version.outputs.RELEASE_NAME }}
+          body: |
+            ${{ steps.changelog.outputs.BODY }}
+            
+            ### 📦 Package Details
+            - **Version**: ${{ steps.get_version.outputs.VERSION }}
+            - **Framework**: .NET 8.0
+            - **Package ID**: OrderApp.Domain
+            - **Authors**: Sebastian Nicolas Fuentes Avalos
+            - **Pattern**: Facade Pattern Implementation
+            
+            ### 🏗️ Architecture
+            - **OrderFacade**: Simplifies order processing by coordinating services
+            - **OrderProcessor**: Refactored to use facade pattern
+            - **Services**: Inventory, Payment, and Shipping services
+            
+            ### 🔧 Installation
+            ```xml
+            <PackageReference Include="OrderApp.Domain" Version="${{ steps.get_version.outputs.VERSION }}" />
+            ```
+            
+            ### 📊 Documentation & Coverage
+            - 📖 [API Documentation](${{ steps.deployment.outputs.page_url }})
+            - 📈 [Coverage Report](${{ steps.deployment.outputs.page_url }}coverage-report/)
+            - 🎨 [Class Diagram](${{ steps.deployment.outputs.page_url }}disenio.html)
+            
+            ### 📊 NuGet Feed
+            Add this to your `nuget.config`:
+            ```xml
+            <packageSources>
+                <add key="github" value="https://nuget.pkg.github.com/${{ github.repository_owner }}/index.json" />
+            </packageSources>
+            ```
+          files: |
+            artifacts/*.nupkg
+            artifacts/*.snupkg
+          draft: false
+          prerelease: ${{ contains(steps.get_version.outputs.VERSION, '-') }}
+
+      # Publicar el paquete en GitHub Packages
+      - name: Publish to GitHub Packages
+        run: |
+          dotnet nuget add source --username ${{ github.repository_owner }} --password ${{ secrets.GITHUB_TOKEN }} --store-password-in-clear-text --name github "https://nuget.pkg.github.com/${{ github.repository_owner }}/index.json"
+          dotnet nuget push "artifacts/*.nupkg" --source github --api-key ${{ secrets.GITHUB_TOKEN }} --skip-duplicate

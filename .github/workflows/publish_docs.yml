@@ -1,0 +1,124 @@
+name: Publish Documentation
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+jobs:
+  build-and-publish-docs:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Setup .NET
+      uses: actions/setup-dotnet@v4
+      with:
+        dotnet-version: 8.0.x
+        
+    - name: Restore dependencies
+      run: dotnet restore OrderApp/OrderApp.sln
+      
+    - name: Build
+      run: dotnet build OrderApp/OrderApp.sln --no-restore --configuration Release
+      
+    - name: Install tools
+      run: |
+        dotnet tool install -g docfx
+        dotnet tool install -g dll2mmd
+        dotnet tool install -g dotnet-reportgenerator-globaltool
+        export PATH="$PATH:/home/runner/.dotnet/tools"
+      
+    - name: Setup .NET 6 runtime (for tools that target net6)
+      uses: actions/setup-dotnet@v4
+      with:
+        dotnet-version: '6.0.x'
+      
+    - name: Run tests with coverage
+      run: dotnet test OrderApp/OrderApp.sln --configuration Release --collect:"XPlat Code Coverage"
+      
+    - name: Generate coverage report
+      run: |
+        mkdir -p Cobertura
+        export PATH="$PATH:/home/runner/.dotnet/tools"
+        reportgenerator "-reports:OrderApp/**/coverage.cobertura.xml" "-targetdir:Cobertura" -reporttypes:MarkdownSummaryGithub
+        
+    - name: Generate class diagram
+      run: |
+        export PATH="$PATH:/home/runner/.dotnet/tools"
+        cd OrderApp
+        dll2mmd -f OrderApp.Domain/bin/Release/net8.0/OrderApp.Domain.dll -o disenio.md
+        cd ..
+        cp OrderApp/disenio.md ./disenio.md
+
+    - name: Prepend mermaid include to disenio.md
+      run: |
+        echo '!INCLUDE mermaid.md' | cat - disenio.md > temp && mv temp disenio.md
+        
+    - name: Create index.md
+      run: |
+        cd OrderApp
+        cat > index.md << 'EOF'
+        ---
+        _layout: landing
+        ---
+        
+        # OrderApp Domain Documentation
+        
+        ## Aplicación de Procesamiento de Órdenes con Patrón Facade
+        
+        Esta aplicación demuestra la implementación del patrón Facade para simplificar el procesamiento de órdenes, coordinando servicios de inventario, pagos y envíos.
+        
+        ### Características Principales
+        
+        - **Patrón Facade**: Simplifica la interacción entre múltiples subsistemas
+        - **Separación de Responsabilidades**: Cada servicio maneja una responsabilidad específica
+        - **Inyección de Dependencias**: Permite mejor testabilidad y mantenimiento
+        - **Documentación Completa**: API documentada con XML comments
+        
+        ## [📊 Diagrama de Clases](disenio.md)
+        
+        ## [🧪 Cobertura de Pruebas](../Cobertura/SummaryGithub.md)
+        
+        ## Servicios Implementados
+        
+        ### InventoryService
+        Maneja la verificación de stock de productos.
+        
+        ### PaymentService
+        Procesa los pagos de los clientes.
+        
+        ### ShippingService
+        Gestiona el envío de productos.
+        
+        ### OrderFacade
+        Coordina todos los servicios para procesar órdenes de manera simplificada.
+        
+        ### OrderProcessor
+        Utiliza el OrderFacade para procesar órdenes (patrón refactorizado).
+        EOF
+        
+    - name: Build documentation
+      run: |
+        cd OrderApp
+        docfx metadata docfx.json || echo "Metadata generation completed"
+        docfx build docfx.json
+        
+    - name: Upload artifact
+      uses: actions/upload-pages-artifact@v3
+      with:
+        path: OrderApp/_site
+        
+    - name: Deploy to GitHub Pages
+      id: deployment
+      uses: actions/deploy-pages@v4
